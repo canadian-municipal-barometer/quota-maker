@@ -16,10 +16,15 @@ suppressPackageStartupMessages({
 set_cancensus_api_key("CensusMapper_e8117c5ce4c23c5b5ce1fb530f7aea86")
 
 # Used in QUOTAS below; resolved to census vectors after the settings.
+
+# Placeholder category: the dimension's `.base` population minus the sum of
+# its other categories (e.g. "no degree" = 15+ population minus "degree").
 REST <- "REST"
+
+# Describes an age range (inclusive, in years) for one sex, e.g. ages(18, 29)
+# or ages(60, Inf, "Female"). Returns a small "ages" object rather than census
+# ids; resolve() later turns it into the matching age-group vectors.
 ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
-  # create a list with a class attribute of "ages"
-  # Specifies an age range and sex for later resolution to census vectors.
   structure(list(from = from, to = to, sex = match.arg(sex)), class = "ages")
 }
 
@@ -50,12 +55,16 @@ QUOTAS <- list(
 )
 
 # ---- helpers -----------------------------------------------------------------
+# Validation helper: if `bad` holds any offending values, stop with `msg`
+# followed by the de-duplicated list of them. Does nothing when `bad` is empty.
 stop_if_any <- function(bad, msg) {
   if (length(bad)) stop(msg, ": ", paste(unique(bad), collapse = ", "))
 }
 
-# Coarsest Census age groups that exactly cover from..to, e.g. 18-29 is
-# 18, 19, 20 to 24, 25 to 29. Fewer cells means less rounding noise.
+# Returns the Census age-group labels that together cover ages from..to.
+# Picks the coarsest groups that fit exactly, e.g. 18-29 is 18, 19, 20 to 24,
+# 25 to 29. Fewer cells means less rounding noise. Open-ended ranges
+# (to = Inf) finish with a "65/85/100 years and over" group.
 age_labels <- function(from, to) {
   out <- character()
   a <- from
@@ -77,7 +86,11 @@ age_labels <- function(from, to) {
   out
 }
 
-# Looked up by label, not vector number, so nothing depends on offsets.
+# Turns one QUOTAS category into census vector ids. Plain ids (and REST) pass
+# through unchanged; an ages() object becomes the ids of its age groups for the
+# requested sex, found in `catalogue` (from list_census_vectors()). Looked up
+# by label, not vector number, so nothing depends on offsets. Errors if any
+# age group is missing or matches more than once.
 resolve <- function(x, catalogue) {
   if (!inherits(x, "ages")) {
     return(x)
@@ -95,7 +108,10 @@ resolve <- function(x, catalogue) {
   hits$vector
 }
 
-# Largest-remainder rounding: cells sum exactly to the cap.
+# Splits `cap` interviews across categories in line with `proportion` (which
+# should sum to 1). Uses largest-remainder rounding: round everything down,
+# then give the leftover interviews to the cells with the biggest fractional
+# parts, so the integer quotas sum exactly to the cap.
 allocate <- function(proportion, cap) {
   exact <- proportion * cap
   out <- floor(exact)
@@ -149,6 +165,8 @@ stop_if_any(muns$census_id[is.na(id_level)], "census_id not 2, 4 or 7 digits")
 
 message("querying cancensus for ", nrow(muns), " regions ...")
 by_level <- split(muns$census_id, id_level)
+# One get_census() call per geographic level, each returning the id,
+# total population and the requested vectors; then stacked into one table.
 census <- Map(
   \(ids, level) {
     get_census(
@@ -182,6 +200,10 @@ stop_if_any(
 )
 
 # ---- quotas ------------------------------------------------------------------
+# Census population of each category in dimension `d`, for every
+# municipality. Sums each category's vectors from `raw`, computes REST as
+# `.base` minus the other categories, and returns long data: one row per
+# municipality x category, with `order` keeping the QUOTAS category order.
 dimension_counts <- function(d) {
   cats <- spec[[d]][names(spec[[d]]) != ".base"]
   is_rest <- vapply(cats, identical, logical(1), REST)
