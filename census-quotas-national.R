@@ -33,6 +33,9 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
 
 DATASET <- "CA21"
 CAP <- 1000 # total national sample size
+# TRUE: quotas for people who can speak English (English only, or English and
+# French), from Statistics Canada cross-tabs. See "english speakers" below.
+ENGLISH_ONLY <- FALSE
 
 # Each dimension lists mutually exclusive categories. A category is a vector of
 # census ids (summed) or ages(from, to, sex). REST is `.base` minus the other
@@ -123,6 +126,59 @@ allocate <- function(proportion, cap) {
   as.integer(out)
 }
 
+# Builds a Statistics Canada table coordinate: one member id per dimension, in
+# dimension order, padded with zeros to the 10 positions the API expects.
+coord <- function(...) {
+  ids <- c(...)
+  paste(c(ids, rep(0, 10 - length(ids))), collapse = ".")
+}
+
+# Fetches the 2021 value of each cell `coords` in Statistics Canada table
+# `pid`, via the Web Data Service. Returns values in the order of `coords`.
+statcan_values <- function(pid, coords) {
+  coords <- unname(coords) # a named list would be sent as a JSON object
+  body <- lapply(
+    coords,
+    \(x) list(productId = pid, coordinate = x, latestN = 1)
+  )
+  res <- httr2::request(
+    "https://www150.statcan.gc.ca/t1/wds/rest/getDataFromCubePidCoordAndLatestNPeriods"
+  ) |>
+    httr2::req_body_json(body) |>
+    httr2::req_perform() |>
+    httr2::resp_body_json()
+  ok <- vapply(res, \(r) identical(r$status, "SUCCESS"), logical(1))
+  if (!all(ok)) {
+    stop("Statistics Canada table ", pid, " returned no data for some cells")
+  }
+  got <- vapply(res, \(r) r$object$coordinate, character(1))
+  vals <- vapply(
+    res,
+    \(r) as.numeric(r$object$vectorDataPoint[[1]]$value %||% NA),
+    numeric(1)
+  )
+  vals[match(coords, got)]
+}
+
+# Member ids of dimension `position` in Statistics Canada table `pid`, named by
+# member label.
+statcan_members <- function(pid, position) {
+  meta <- httr2::request(
+    "https://www150.statcan.gc.ca/t1/wds/rest/getCubeMetadata"
+  ) |>
+    httr2::req_body_json(list(list(productId = pid))) |>
+    httr2::req_perform() |>
+    httr2::resp_body_json()
+  dim <- Filter(
+    \(d) d$dimensionPositionId == position,
+    meta[[1]]$object$dimension
+  )[[1]]
+  setNames(
+    vapply(dim$member, \(m) m$memberId, integer(1)),
+    vapply(dim$member, \(m) m$memberNameEn, character(1))
+  )
+}
+
 # ---- resolve the spec --------------------------------------------------------
 if (!nzchar(Sys.getenv("CM_API_KEY"))) {
   stop("CM_API_KEY is not set; add it to ~/.Renviron.")
@@ -173,6 +229,81 @@ stop_if_any(
   "suppressed or missing census cells"
 )
 
+# ---- english speakers --------------------------------------------------------
+# The Census Profile doesn't cross language with age or education, so with
+# ENGLISH_ONLY each vector's count is replaced by an English-speaker count
+# from one of two Statistics Canada tables:
+#   98-10-0619 (knowledge of languages by age and gender): each age-group
+#     vector is scaled by the share of its sex and 10-year age band (15-24,
+#     25-34, ..., 65+) who can speak English. This assumes the share is flat
+#     within a band, e.g. the same for 18-year-olds as for 24-year-olds.
+#   98-10-0365 (knowledge of official languages by highest degree, age and
+#     gender, 15+ in private households): each education vector is replaced
+#     by its English only plus English and French count.
+# Other kinds of vectors aren't published by language and stop the script.
+suffix <- ""
+if (ENGLISH_ONLY) {
+  message("querying Statistics Canada for English speakers ...")
+  suffix <- "-english"
+  info <- catalogue[match(vectors, catalogue$vector), ]
+  gender <- c(Total = 1, Male = 2, Female = 3)[as.character(info$type)]
+  is_age <- grepl("; Total - Age", info$details)
+  is_edu <- grepl("; Education; Total - Highest certificate", info$details)
+  stop_if_any(
+    vectors[!is_age & !is_edu],
+    "ENGLISH_ONLY only handles ages() and highest-degree vectors, not"
+  )
+
+  # 98-10-0619 dims: geography, age, gender, mother tongue, knowledge of
+  # languages, generation status. Age members 2-8 start at these ages;
+  # knowledge member 1 is everyone and 3 is "English".
+  from <- suppressWarnings(as.numeric(sub("^(\\d+).*", "\\1", info$label)))
+  from[info$label == "Under 1 year"] <- 0
+  band <- findInterval(from, c(0, 15, 25, 35, 45, 55, 65)) + 1
+  cells <- mapply(
+    \(b, g, k) coord(1, b, g, 1, k, 1),
+    rep(band[is_age], 2),
+    rep(gender[is_age], 2),
+    rep(c(3, 1), each = sum(is_age))
+  )
+  vals <- statcan_values(98100619, cells)
+  share <- vals[seq_len(sum(is_age))] / vals[-seq_len(sum(is_age))]
+
+  # 98-10-0365 dims: geography, degree, immigrant status, work activity, age,
+  # gender, income statistics, knowledge of official languages. Degree members
+  # are matched by label; age member 1 is 15+ and 3 is 25-64; knowledge
+  # members 2 and 4 are English only and English and French.
+  edu <- statcan_members(98100365, 2)
+  names(edu) <- gsub("’", "'", names(edu))
+  label <- sub("^Total - .*", names(edu)[1], info$label[is_edu])
+  age <- ifelse(
+    grepl("aged 15 years and over", info$details[is_edu]),
+    1,
+    ifelse(grepl("aged 25 to 64 years", info$details[is_edu]), 3, NA)
+  )
+  stop_if_any(
+    vectors[is_edu][is.na(edu[label]) | is.na(age)],
+    "no Statistics Canada match for"
+  )
+  cells <- mapply(
+    \(e, a, g, k) coord(1, e, 1, 1, a, g, 1, k),
+    rep(edu[label], 2),
+    rep(age, 2),
+    rep(gender[is_edu], 2),
+    rep(c(2, 4), each = sum(is_edu))
+  )
+  vals <- statcan_values(98100365, cells)
+  english <- vals[seq_len(sum(is_edu))] + vals[-seq_len(sum(is_edu))]
+
+  stop_if_any(
+    c(vectors[is_age][is.na(share)], vectors[is_edu][is.na(english)]),
+    "suppressed or missing Statistics Canada cells for"
+  )
+  raw[vectors[is_age]] <- as.list(unlist(raw[vectors[is_age]]) * share)
+  raw[vectors[is_edu]] <- as.list(english)
+  write_csv(raw, "census-raw-national-english.csv")
+}
+
 # ---- quotas ------------------------------------------------------------------
 # National census population of each category in dimension `d`. Sums each
 # category's vectors from `raw`, computes REST as `.base` minus the other
@@ -214,5 +345,6 @@ off <- quotas |>
   filter(allocated != CAP)
 stop_if_any(off$dimension, "quotas don't sum to cap for")
 
-write_csv(quotas, "quotas-national.csv")
-message("wrote census-raw-national.csv and quotas-national.csv")
+out <- paste0("quotas-national", suffix, ".csv")
+write_csv(quotas, out)
+message("wrote ", out)
