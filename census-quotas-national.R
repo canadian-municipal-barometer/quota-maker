@@ -1,9 +1,9 @@
-# Census quotas
+# Census quotas: national level
 #
-# Builds per-municipality survey quotas from the Census Profile via cancensus R
-# package.
+# Builds a single set of Canada-wide survey quotas from the Census Profile via
+# cancensus R package. For per-municipality quotas use census-quotas-csd.R.
 # Copy this folder into a study, edit the settings, and run from the folder:
-#   Rscript census-quotas.R
+#   Rscript census-quotas-national.R
 
 suppressPackageStartupMessages({
   library(cancensus)
@@ -30,7 +30,7 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
 
 # ---- settings ----------------------------------------------------------------
 DATASET <- "CA21"
-MUNICIPALITIES <- "municipalities.csv" # name, census_id, cap (all required)
+CAP <- 1000 # total national sample size
 OUT_DIR <- "output"
 
 # Each dimension lists mutually exclusive categories. A category is a vector of
@@ -124,6 +124,10 @@ allocate <- function(proportion, cap) {
 if (!nzchar(Sys.getenv("CM_API_KEY"))) {
   stop("CM_API_KEY is not set; add it to ~/.Renviron.")
 }
+if (!(length(CAP) == 1 && CAP >= 1 && CAP == round(CAP))) {
+  stop("CAP must be a single positive whole number")
+}
+CAP <- as.integer(CAP)
 
 catalogue <- list_census_vectors(DATASET, quiet = TRUE)
 spec <- lapply(QUOTAS, \(dim) lapply(dim, resolve, catalogue = catalogue))
@@ -140,138 +144,71 @@ for (d in names(spec)) {
 vectors <- setdiff(unique(unlist(spec)), REST)
 stop_if_any(setdiff(vectors, catalogue$vector), paste("not a", DATASET, "id"))
 
-# ---- municipalities ----------------------------------------------------------
-# census_id stays character: a numeric read drops leading zeros.
-muns <- read_csv(MUNICIPALITIES, col_types = cols(.default = col_character()))
-stop_if_any(
-  setdiff(c("name", "census_id", "cap"), names(muns)),
-  paste(MUNICIPALITIES, "is missing column")
-)
-stop_if_any(muns$census_id[duplicated(muns$census_id)], "duplicate census_id")
-# Every municipality needs an explicit cap: a positive whole number.
-stop_if_any(
-  muns$name[!grepl("^[1-9][0-9]*$", trimws(coalesce(muns$cap, "")))],
-  "missing or invalid cap for"
-)
-muns <- muns |>
-  mutate(cap = as.integer(cap))
-
 # ---- census pull -------------------------------------------------------------
-# Level follows the id length: 7 digits = CSD, 4 = CD, 2 = PR.
-id_level <- c("7" = "CSD", "4" = "CD", "2" = "PR")[
-  as.character(nchar(muns$census_id))
-]
-stop_if_any(muns$census_id[is.na(id_level)], "census_id not 2, 4 or 7 digits")
-
-message("querying cancensus for ", nrow(muns), " regions ...")
-by_level <- split(muns$census_id, id_level)
-# One get_census() call per geographic level, each returning the id,
-# total population and the requested vectors; then stacked into one table.
-census <- Map(
-  \(ids, level) {
-    get_census(
-      dataset = DATASET,
-      regions = setNames(list(ids), level),
-      level = level,
-      vectors = vectors,
-      labels = "short",
-      use_cache = TRUE,
-      quiet = TRUE
-    ) |>
-      select(census_id = GeoUID, population = Population, all_of(vectors))
-  },
-  by_level,
-  names(by_level)
+# Canada as a whole is region "01" at level "C".
+message("querying cancensus for Canada ...")
+raw <- get_census(
+  dataset = DATASET,
+  regions = list(C = "01"),
+  level = "C",
+  vectors = vectors,
+  labels = "short",
+  use_cache = TRUE,
+  quiet = TRUE
 ) |>
-  bind_rows()
+  select(population = Population, all_of(vectors))
 
-stop_if_any(setdiff(muns$census_id, census$census_id), "no census data for")
-stop_if_any(census$census_id[duplicated(census$census_id)], "repeated rows for")
-
-raw <- muns |>
-  left_join(census, by = "census_id")
+if (nrow(raw) != 1) stop("expected one row for Canada, got ", nrow(raw))
 
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
-write_csv(raw, file.path(OUT_DIR, "census-raw.csv")) # before checks, to inspect
+# before checks, to inspect
+write_csv(raw, file.path(OUT_DIR, "census-raw-national.csv"))
 
 stop_if_any(
-  filter(raw, if_any(all_of(vectors), is.na))$name,
-  "suppressed or missing census cells for"
+  vectors[vapply(raw[vectors], is.na, logical(1))],
+  "suppressed or missing census cells"
 )
 
 # ---- quotas ------------------------------------------------------------------
-# Census population of each category in dimension `d`, for every
-# municipality. Sums each category's vectors from `raw`, computes REST as
-# `.base` minus the other categories, and returns long data: one row per
-# municipality x category, with `order` keeping the QUOTAS category order.
+# National census population of each category in dimension `d`. Sums each
+# category's vectors from `raw`, computes REST as `.base` minus the other
+# categories, and returns one row per category in QUOTAS order.
 dimension_counts <- function(d) {
   cats <- spec[[d]][names(spec[[d]]) != ".base"]
   is_rest <- vapply(cats, identical, logical(1), REST)
-  pops <- lapply(cats[!is_rest], \(v) rowSums(raw[v]))
+  pops <- vapply(cats[!is_rest], \(v) sum(unlist(raw[v])), numeric(1))
   if (any(is_rest)) {
-    pops[[names(cats)[is_rest]]] <- rowSums(raw[spec[[d]]$.base]) -
-      Reduce(`+`, pops)
+    pops[names(cats)[is_rest]] <- sum(unlist(raw[spec[[d]]$.base])) -
+      sum(pops)
   }
 
-  raw |>
-    select(name, census_id, cap) |>
-    bind_cols(as_tibble(pops[names(cats)])) |>
-    pivot_longer(
-      all_of(names(cats)),
-      names_to = "category",
-      values_to = "population"
-    ) |>
-    mutate(dimension = d, order = match(category, names(cats)))
+  tibble(dimension = d, category = names(cats), population = pops[names(cats)])
 }
 
 counts <- bind_rows(lapply(names(spec), dimension_counts))
 
 stop_if_any(
-  with(filter(counts, population < 0), paste(name, dimension)),
+  filter(counts, population < 0)$dimension,
   "REST came out negative for"
 )
 
 quotas <- counts |>
-  group_by(census_id, dimension) |>
-  mutate(total = sum(population)) |>
-  ungroup()
-stop_if_any(
-  with(filter(quotas, total == 0), paste(name, dimension)),
-  "no population in"
-)
+  mutate(total = sum(population), .by = dimension)
+stop_if_any(filter(quotas, total == 0)$dimension, "no population in")
 
 quotas <- quotas |>
-  group_by(census_id, dimension) |>
   mutate(
+    cap = CAP,
     proportion = population / total,
-    quota = allocate(proportion, first(cap))
+    quota = allocate(proportion, CAP),
+    .by = dimension
   ) |>
-  ungroup() |>
-  arrange(
-    match(census_id, muns$census_id),
-    match(dimension, names(spec)),
-    order
-  ) |>
-  select(
-    name,
-    census_id,
-    cap,
-    dimension,
-    category,
-    population,
-    proportion,
-    quota
-  )
+  select(cap, dimension, category, population, proportion, quota)
 
 off <- quotas |>
-  summarise(allocated = sum(quota), .by = c(name, cap, dimension)) |>
-  filter(allocated != cap)
-stop_if_any(paste(off$name, off$dimension), "quotas don't sum to cap for")
+  summarise(allocated = sum(quota), .by = dimension) |>
+  filter(allocated != CAP)
+stop_if_any(off$dimension, "quotas don't sum to cap for")
 
-write_csv(quotas, file.path(OUT_DIR, "quotas.csv"))
-message(
-  "wrote census-raw.csv and quotas.csv for ",
-  nrow(muns),
-  " municipalities to ",
-  OUT_DIR
-)
+write_csv(quotas, file.path(OUT_DIR, "quotas-national.csv"))
+message("wrote census-raw-national.csv and quotas-national.csv to ", OUT_DIR)
