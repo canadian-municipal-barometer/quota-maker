@@ -31,7 +31,6 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
 # ---- settings ----------------------------------------------------------------
 DATASET <- "CA21"
 CAP <- 1000 # total national sample size
-OUT_DIR <- "output"
 
 # Each dimension lists mutually exclusive categories. A category is a vector of
 # census ids (summed) or ages(from, to, sex). REST is `.base` minus the other
@@ -160,9 +159,8 @@ raw <- get_census(
 
 if (nrow(raw) != 1) stop("expected one row for Canada, got ", nrow(raw))
 
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 # before checks, to inspect
-write_csv(raw, file.path(OUT_DIR, "census-raw-national.csv"))
+write_csv(raw, "census-raw-national.csv")
 
 stop_if_any(
   vectors[vapply(raw[vectors], is.na, logical(1))],
@@ -210,5 +208,5 @@ off <- quotas |>
   filter(allocated != CAP)
 stop_if_any(off$dimension, "quotas don't sum to cap for")
 
-write_csv(quotas, file.path(OUT_DIR, "quotas-national.csv"))
-message("wrote census-raw-national.csv and quotas-national.csv to ", OUT_DIR)
+write_csv(quotas, "quotas-national.csv")
+message("wrote census-raw-national.csv and quotas-national.csv")

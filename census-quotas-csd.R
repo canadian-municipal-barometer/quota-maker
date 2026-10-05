@@ -31,7 +31,6 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
 # ---- settings ----------------------------------------------------------------
 DATASET <- "CA21"
 MUNICIPALITIES <- "municipalities.csv" # name, census_id, cap (all required)
-OUT_DIR <- "output"
 
 # Each dimension lists mutually exclusive categories. A category is a vector of
 # census ids (summed) or ages(from, to, sex). REST is `.base` minus the other
@@ -191,8 +190,7 @@ stop_if_any(census$census_id[duplicated(census$census_id)], "repeated rows for")
 raw <- muns |>
   left_join(census, by = "census_id")
 
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
-write_csv(raw, file.path(OUT_DIR, "census-raw.csv")) # before checks, to inspect
+write_csv(raw, "census-raw.csv") # before checks, to inspect
 
 stop_if_any(
   filter(raw, if_any(all_of(vectors), is.na))$name,
@@ -268,10 +266,9 @@ off <- quotas |>
   filter(allocated != cap)
 stop_if_any(paste(off$name, off$dimension), "quotas don't sum to cap for")
 
-write_csv(quotas, file.path(OUT_DIR, "quotas.csv"))
+write_csv(quotas, "quotas.csv")
 message(
   "wrote census-raw.csv and quotas.csv for ",
   nrow(muns),
-  " municipalities to ",
-  OUT_DIR
+  " municipalities"
 )

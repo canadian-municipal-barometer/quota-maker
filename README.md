@@ -3,7 +3,7 @@
 Builds survey quotas (sex, age, degree, etc.) from the Census Profile using the
 [cancensus](https://mountainmath.github.io/cancensus/) R package. Copy this
 folder into a study, edit the settings at the top of a script, and run it from
-the folder. Results go to `output/`.
+the folder. Results are written to the same folder.
 
 | File | What it does |
 |---|---|
