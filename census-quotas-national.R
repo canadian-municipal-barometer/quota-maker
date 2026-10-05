@@ -28,6 +28,30 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
   structure(list(from = from, to = to, sex = match.arg(sex)), class = "ages")
 }
 
+# Province and territory codes, as used by the census.
+PROVINCES <- c(
+  "10" = "Newfoundland and Labrador",
+  "11" = "Prince Edward Island",
+  "12" = "Nova Scotia",
+  "13" = "New Brunswick",
+  "24" = "Quebec",
+  "35" = "Ontario",
+  "46" = "Manitoba",
+  "47" = "Saskatchewan",
+  "48" = "Alberta",
+  "59" = "British Columbia",
+  "60" = "Yukon",
+  "61" = "Northwest Territories",
+  "62" = "Nunavut"
+)
+
+# Restricts a category to some provinces or territories (codes from PROVINCES,
+# summed), e.g. in_province("24", ages(18)) is adults in Quebec. Categories
+# without it count all of Canada.
+in_province <- function(codes, x) {
+  structure(list(codes = codes, x = x), class = "in_province")
+}
+
 # ---- settings ----------------------------------------------------------------
 # CHANGE THIS SECTION TO SPECIFY YOUR STUDY'S QUOTAS
 
@@ -38,8 +62,9 @@ CAP <- 1000 # total national sample size
 ENGLISH_ONLY <- FALSE
 
 # Each dimension lists mutually exclusive categories. A category is a vector of
-# census ids (summed) or ages(from, to, sex). REST is `.base` minus the other
-# categories. Find ids with find_census_vectors("bachelor", dataset = DATASET).
+# census ids (summed) or ages(from, to, sex), optionally wrapped in
+# in_province(codes, ...). REST is `.base` minus the other categories. Find ids
+# with find_census_vectors("bachelor", dataset = DATASET).
 QUOTAS <- list(
   sex = list(
     Male = ages(18, Inf, sex = "Male"),
@@ -55,6 +80,19 @@ QUOTAS <- list(
     .base = "v_CA21_5817", # 15+ in private households
     Yes = "v_CA21_5847", # bachelor's degree or higher
     No = REST
+  ),
+  province = list(
+    "Newfoundland and Labrador" = in_province("10", ages(18)),
+    "Prince Edward Island" = in_province("11", ages(18)),
+    "Nova Scotia" = in_province("12", ages(18)),
+    "New Brunswick" = in_province("13", ages(18)),
+    Quebec = in_province("24", ages(18)),
+    Ontario = in_province("35", ages(18)),
+    Manitoba = in_province("46", ages(18)),
+    Saskatchewan = in_province("47", ages(18)),
+    Alberta = in_province("48", ages(18)),
+    "British Columbia" = in_province("59", ages(18)),
+    Territories = in_province(c("60", "61", "62"), ages(18))
   )
 )
 
@@ -96,8 +134,16 @@ age_labels <- function(from, to) {
 # through unchanged; an ages() object becomes the ids of its age groups for the
 # requested sex, found in `catalogue` (from list_census_vectors()). Looked up
 # by label, not vector number, so nothing depends on offsets. Errors if any
-# age group is missing or matches more than once.
+# age group is missing or matches more than once. An in_province() category
+# keeps its codes and resolves what it wraps.
 resolve <- function(x, catalogue) {
+  if (inherits(x, "in_province")) {
+    stop_if_any(setdiff(x$codes, names(PROVINCES)), "not a province code")
+    return(structure(
+      list(geo = x$codes, ids = resolve(x$x, catalogue)),
+      class = "in_province"
+    ))
+  }
   if (!inherits(x, "ages")) {
     return(x)
   }
@@ -114,6 +160,11 @@ resolve <- function(x, catalogue) {
   hits$vector
 }
 
+# The census ids, and the geographies (Canada "01" or province codes), that a
+# resolved category draws on.
+ids_of <- function(x) if (inherits(x, "in_province")) x$ids else x
+geo_of <- function(x) if (inherits(x, "in_province")) x$geo else "01"
+
 # Splits `cap` interviews across categories in line with `proportion` (which
 # should sum to 1). Uses largest-remainder rounding: round everything down,
 # then give the leftover interviews to the cells with the biggest fractional
@@ -126,27 +177,36 @@ allocate <- function(proportion, cap) {
   as.integer(out)
 }
 
-# Builds a Statistics Canada table coordinate: one member id per dimension, in
+# Builds Statistics Canada table coordinates: one member id per dimension, in
 # dimension order, padded with zeros to the 10 positions the API expects.
+# Vectorised: each argument can hold one member id per coordinate.
 coord <- function(...) {
-  ids <- c(...)
-  paste(c(ids, rep(0, 10 - length(ids))), collapse = ".")
+  ids <- list(...)
+  do.call(paste, c(ids, rep(list(0), 10 - length(ids)), sep = "."))
 }
 
 # Fetches the 2021 value of each cell `coords` in Statistics Canada table
-# `pid`, via the Web Data Service. Returns values in the order of `coords`.
+# `pid`, via the Web Data Service, 100 cells per request. Returns values in the
+# order of `coords`.
 statcan_values <- function(pid, coords) {
   coords <- unname(coords) # a named list would be sent as a JSON object
-  body <- lapply(
-    coords,
-    \(x) list(productId = pid, coordinate = x, latestN = 1)
+  todo <- unique(coords)
+  fetch <- function(chunk) {
+    body <- lapply(
+      chunk,
+      \(x) list(productId = pid, coordinate = x, latestN = 1)
+    )
+    httr2::request(
+      "https://www150.statcan.gc.ca/t1/wds/rest/getDataFromCubePidCoordAndLatestNPeriods"
+    ) |>
+      httr2::req_body_json(body) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+  }
+  res <- unlist(
+    lapply(split(todo, ceiling(seq_along(todo) / 100)), fetch),
+    recursive = FALSE
   )
-  res <- httr2::request(
-    "https://www150.statcan.gc.ca/t1/wds/rest/getDataFromCubePidCoordAndLatestNPeriods"
-  ) |>
-    httr2::req_body_json(body) |>
-    httr2::req_perform() |>
-    httr2::resp_body_json()
   ok <- vapply(res, \(r) identical(r$status, "SUCCESS"), logical(1))
   if (!all(ok)) {
     stop("Statistics Canada table ", pid, " returned no data for some cells")
@@ -200,32 +260,42 @@ for (d in names(spec)) {
   if (any(is_rest) != has_base) stop(d, ": REST and .base go together")
 }
 
-vectors <- setdiff(unique(unlist(spec)), REST)
+vectors <- setdiff(unique(unlist(lapply(spec, lapply, ids_of))), REST)
 stop_if_any(setdiff(vectors, catalogue$vector), paste("not a", DATASET, "id"))
+provinces <- setdiff(unique(unlist(lapply(spec, lapply, geo_of))), "01")
 
 # ---- census pull -------------------------------------------------------------
-# Canada as a whole is region "01" at level "C".
-message("querying cancensus for Canada ...")
-raw <- get_census(
-  dataset = DATASET,
-  regions = list(C = "01"),
-  level = "C",
-  vectors = vectors,
-  labels = "short",
-  use_cache = TRUE,
-  quiet = TRUE
-) |>
-  select(population = Population, all_of(vectors))
+# One row for Canada as a whole (region "01" at level "C"), plus one per
+# province or territory that an in_province() category uses.
+pull <- function(level) {
+  get_census(
+    dataset = DATASET,
+    regions = list(C = "01"),
+    level = level,
+    vectors = vectors,
+    labels = "short",
+    use_cache = TRUE,
+    quiet = TRUE
+  ) |>
+    select(geo = GeoUID, population = Population, all_of(vectors))
+}
 
+message("querying cancensus for Canada ...")
+raw <- pull("C") |>
+  mutate(geo = "01")
 if (nrow(raw) != 1) {
   stop("expected one row for Canada, got ", nrow(raw))
+}
+if (length(provinces)) {
+  raw <- bind_rows(raw, filter(pull("PR"), geo %in% provinces))
+  stop_if_any(setdiff(provinces, raw$geo), "no census data for province")
 }
 
 # before checks, to inspect
 write_csv(raw, "census-raw-national.csv")
 
 stop_if_any(
-  vectors[vapply(raw[vectors], is.na, logical(1))],
+  vectors[vapply(raw[vectors], anyNA, logical(1))],
   "suppressed or missing census cells"
 )
 
@@ -240,6 +310,7 @@ stop_if_any(
 #   98-10-0365 (knowledge of official languages by highest degree, age and
 #     gender, 15+ in private households): each education vector is replaced
 #     by its English only plus English and French count.
+# Both are applied to each row of `raw` with that geography's own figures.
 # Other kinds of vectors aren't published by language and stop the script.
 suffix <- ""
 if (ENGLISH_ONLY) {
@@ -253,6 +324,8 @@ if (ENGLISH_ONLY) {
     vectors[!is_age & !is_edu],
     "ENGLISH_ONLY only handles ages() and highest-degree vectors, not"
   )
+  adj <- as.matrix(raw[vectors])
+  geo_name <- c("01" = "Canada", PROVINCES)[raw$geo]
 
   # 98-10-0619 dims: geography, age, gender, mother tongue, knowledge of
   # languages, generation status. Age members 2-8 start at these ages;
@@ -260,14 +333,13 @@ if (ENGLISH_ONLY) {
   from <- suppressWarnings(as.numeric(sub("^(\\d+).*", "\\1", info$label)))
   from[info$label == "Under 1 year"] <- 0
   band <- findInterval(from, c(0, 15, 25, 35, 45, 55, 65)) + 1
-  cells <- mapply(
-    \(b, g, k) coord(1, b, g, 1, k, 1),
-    rep(band[is_age], 2),
-    rep(gender[is_age], 2),
-    rep(c(3, 1), each = sum(is_age))
-  )
-  vals <- statcan_values(98100619, cells)
-  share <- vals[seq_len(sum(is_age))] / vals[-seq_len(sum(is_age))]
+  geo <- statcan_members(98100619, 1)[geo_name]
+  a <- expand.grid(row = seq_len(nrow(raw)), j = which(is_age))
+  cell <- \(k) coord(geo[a$row], band[a$j], gender[a$j], 1, k, 1)
+  ij <- cbind(a$row, a$j)
+  adj[ij] <- adj[ij] *
+    statcan_values(98100619, cell(3)) /
+    statcan_values(98100619, cell(1))
 
   # 98-10-0365 dims: geography, degree, immigrant status, work activity, age,
   # gender, income statistics, knowledge of official languages. Degree members
@@ -275,46 +347,48 @@ if (ENGLISH_ONLY) {
   # members 2 and 4 are English only and English and French.
   edu <- statcan_members(98100365, 2)
   names(edu) <- gsub("’", "'", names(edu))
-  label <- sub("^Total - .*", names(edu)[1], info$label[is_edu])
+  label <- sub("^Total - .*", names(edu)[1], info$label)
   age <- ifelse(
-    grepl("aged 15 years and over", info$details[is_edu]),
+    grepl("aged 15 years and over", info$details),
     1,
-    ifelse(grepl("aged 25 to 64 years", info$details[is_edu]), 3, NA)
+    ifelse(grepl("aged 25 to 64 years", info$details), 3, NA)
   )
   stop_if_any(
-    vectors[is_edu][is.na(edu[label]) | is.na(age)],
+    vectors[is_edu & (is.na(edu[label]) | is.na(age))],
     "no Statistics Canada match for"
   )
-  cells <- mapply(
-    \(e, a, g, k) coord(1, e, 1, 1, a, g, 1, k),
-    rep(edu[label], 2),
-    rep(age, 2),
-    rep(gender[is_edu], 2),
-    rep(c(2, 4), each = sum(is_edu))
-  )
-  vals <- statcan_values(98100365, cells)
-  english <- vals[seq_len(sum(is_edu))] + vals[-seq_len(sum(is_edu))]
+  geo <- statcan_members(98100365, 1)[geo_name]
+  e <- expand.grid(row = seq_len(nrow(raw)), j = which(is_edu))
+  cell <- \(k)
+    coord(geo[e$row], edu[label[e$j]], 1, 1, age[e$j], gender[e$j], 1, k)
+  ij <- cbind(e$row, e$j)
+  adj[ij] <- statcan_values(98100365, cell(2)) +
+    statcan_values(98100365, cell(4))
 
   stop_if_any(
-    c(vectors[is_age][is.na(share)], vectors[is_edu][is.na(english)]),
+    vectors[colSums(is.na(adj)) > 0],
     "suppressed or missing Statistics Canada cells for"
   )
-  raw[vectors[is_age]] <- as.list(unlist(raw[vectors[is_age]]) * share)
-  raw[vectors[is_edu]] <- as.list(english)
+  raw[vectors] <- as.data.frame(adj)
   write_csv(raw, "census-raw-national-english.csv")
 }
 
 # ---- quotas ------------------------------------------------------------------
-# National census population of each category in dimension `d`. Sums each
-# category's vectors from `raw`, computes REST as `.base` minus the other
-# categories, and returns one row per category in QUOTAS order.
+# Census population of a resolved category: its vectors summed over its
+# geographies' rows of `raw`.
+category_count <- function(x) {
+  sum(as.matrix(raw[raw$geo %in% geo_of(x), ids_of(x)]))
+}
+
+# Census population of each category in dimension `d`. Computes REST as
+# `.base` minus the other categories, and returns one row per category in
+# QUOTAS order.
 dimension_counts <- function(d) {
   cats <- spec[[d]][names(spec[[d]]) != ".base"]
   is_rest <- vapply(cats, identical, logical(1), REST)
-  pops <- vapply(cats[!is_rest], \(v) sum(unlist(raw[v])), numeric(1))
+  pops <- vapply(cats[!is_rest], category_count, numeric(1))
   if (any(is_rest)) {
-    pops[names(cats)[is_rest]] <- sum(unlist(raw[spec[[d]]$.base])) -
-      sum(pops)
+    pops[names(cats)[is_rest]] <- category_count(spec[[d]]$.base) - sum(pops)
   }
 
   tibble(dimension = d, category = names(cats), population = pops[names(cats)])
