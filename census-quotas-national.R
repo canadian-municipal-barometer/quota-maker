@@ -29,6 +29,8 @@ ages <- function(from, to = Inf, sex = c("Total", "Male", "Female")) {
 }
 
 # ---- settings ----------------------------------------------------------------
+# CHANGE THIS SECTION TO SPECIFY YOUR STUDY'S QUOTAS
+
 DATASET <- "CA21"
 CAP <- 1000 # total national sample size
 
@@ -52,6 +54,8 @@ QUOTAS <- list(
     No = REST
   )
 )
+
+# END SETTINGS. The rest of the script is generic and doesn't need editing.
 
 # ---- helpers -----------------------------------------------------------------
 # Validation helper: if `bad` holds any offending values, stop with `msg`
@@ -157,7 +161,9 @@ raw <- get_census(
 ) |>
   select(population = Population, all_of(vectors))
 
-if (nrow(raw) != 1) stop("expected one row for Canada, got ", nrow(raw))
+if (nrow(raw) != 1) {
+  stop("expected one row for Canada, got ", nrow(raw))
+}
 
 # before checks, to inspect
 write_csv(raw, "census-raw-national.csv")
